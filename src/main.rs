@@ -22,7 +22,9 @@ struct Joint {
 #[derive(Debug)]
 pub struct Channel {
     type_: ChannelType,
-    values: Vec<f32>,
+    value_range_min: f32,
+    value_range: f32,
+    values: Vec<u16>,
 }
 
 #[derive(Debug)]
@@ -42,26 +44,37 @@ enum JointChildren {
 }
 
 fn build_mocap(bvh: &bvh::Bvh) -> Mocap {
-    let mut ret = Mocap {
+    let mut channel_index = 0;
+
+    Mocap {
         num_frames: bvh.motion.num_frames,
         frame_time: bvh.motion.frame_time as _,
-        root: build_joint(&bvh.hierarchy.root),
-    };
-
-    let mut frame_index = 0;
-    let mut frame_data_index = 0;
-    for _ in 0..bvh.motion.num_frames {
-        pull_frame_data(&mut ret.root, &bvh.motion.frames, &mut frame_index, &mut frame_data_index);
+        root: build_joint(&bvh.hierarchy.root, &bvh.motion.frames, &mut channel_index),
     }
-
-    ret
 }
 
-fn build_joint(bvh_joint: &bvh::Joint) -> Joint {
-    Joint {
-        name: bvh_joint.name.clone(),
-        offset: (bvh_joint.offset.x as _, bvh_joint.offset.y as _, bvh_joint.offset.z as _),
-        channels: bvh_joint.channels.iter().map(|channel| Channel {
+fn build_joint(bvh_joint: &bvh::Joint, frames: &Vec<Vec<f64>>, channel_index: &mut usize) -> Joint {
+    let mut channels = Vec::new();
+    for channel in bvh_joint.channels.iter() {
+        let mut values = Vec::new();
+        for frame in frames.iter() {
+            values.push(frame[*channel_index]);
+        }
+        let mut value_range_min = values[0];
+        let mut value_range_max = values[0];
+        for value in values.iter() {
+            if *value < value_range_min {
+                value_range_min = *value;
+            }
+            if *value > value_range_max {
+                value_range_max = *value;
+            }
+        }
+        let mut value_range = value_range_max - value_range_min;
+
+        *channel_index += 1;
+
+        channels.push(Channel {
             type_: match channel {
                 bvh::Channel::XPosition => ChannelType::TranslationX,
                 bvh::Channel::YPosition => ChannelType::TranslationY,
@@ -70,29 +83,24 @@ fn build_joint(bvh_joint: &bvh::Joint) -> Joint {
                 bvh::Channel::YRotation => ChannelType::RotationY,
                 bvh::Channel::ZRotation => ChannelType::RotationZ,
             },
-            values: Vec::new(),
-        }).collect(),
+            value_range_min: value_range_min as _,
+            value_range: value_range as _,
+            values: values.iter().map(|value| if value_range > 0.0 {
+                (((value - value_range_min) / value_range) * 65535.0) as u16
+            } else {
+                0
+            }).collect(),
+        });
+    }
+
+    Joint {
+        name: bvh_joint.name.clone(),
+        offset: (bvh_joint.offset.x as _, bvh_joint.offset.y as _, bvh_joint.offset.z as _),
+        channels: channels,
         children: match bvh_joint.children {
-            bvh::JointChildren::Joints(ref bvh_joints) => JointChildren::Joints(bvh_joints.iter().map(build_joint).collect()),
+            bvh::JointChildren::Joints(ref bvh_joints) => JointChildren::Joints(bvh_joints.iter().map(|joint| build_joint(joint, frames, channel_index)).collect()),
             bvh::JointChildren::EndSite(ref bvh_end_site) => JointChildren::EndSite((bvh_end_site.offset.x as _, bvh_end_site.offset.y as _, bvh_end_site.offset.z as _)),
         },
-    }
-}
-
-fn pull_frame_data(joint: &mut Joint, frames: &Vec<Vec<f64>>, frame_index: &mut usize, frame_data_index: &mut usize) {
-    for channel in joint.channels.iter_mut() {
-        channel.values.push(frames[*frame_index][*frame_data_index] as _);
-        *frame_data_index += 1;
-        if *frame_data_index >= frames[*frame_index].len() {
-            *frame_data_index = 0;
-            *frame_index += 1;
-        }
-    }
-
-    if let JointChildren::Joints(ref mut joints) = joint.children {
-        for joint in joints.iter_mut() {
-            pull_frame_data(joint, frames, frame_index, frame_data_index);
-        }
     }
 }
 
@@ -124,7 +132,7 @@ fn build_bvh_joint(joint: &Joint, frames: &mut Vec<Vec<f64>>) -> bvh::Joint {
         });
 
         for (index, value) in channel.values.iter().enumerate() {
-            frames[index].push(*value as _);
+            frames[index].push((channel.value_range_min as f64) + ((*value as f64) / 65535.0) * (channel.value_range as f64));
         }
     }
 
@@ -152,7 +160,7 @@ fn build_bvh_offset(offset: &(f32, f32, f32)) -> bvh::Offset {
 fn dump_channels<W: Write>(joint: &Joint, w: &mut W) -> io::Result<()> {
     for channel in joint.channels.iter() {
         for (index, value) in channel.values.iter().enumerate() {
-            writeln!(w, "{};{}", index, value)?;
+            writeln!(w, "{};{}", index, (channel.value_range_min as f64) + ((*value as f64) / 65535.0) * (channel.value_range as f64))?;
         }
     }
 
