@@ -2,7 +2,7 @@ extern crate bvh;
 
 use std::env::args;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read, Write};
 
 #[derive(Debug)]
 struct Mocap {
@@ -97,6 +97,7 @@ fn pull_frame_data(joint: &mut Joint, frames: &Vec<Vec<f64>>, frame_index: &mut 
 fn main() {
     let input_file_name = args().nth(1).unwrap();
     let output_file_name = args().nth(2).unwrap();
+    let csv_file_name = args().nth(3).unwrap();
 
     let input = {
         let mut ret = String::new();
@@ -116,5 +117,26 @@ fn main() {
 
     let mocap = build_mocap(&bvh);
 
-    println!("Result: {:#?}", mocap);
+    //println!("Result: {:#?}", mocap);
+
+    {
+        let mut csv = File::create(csv_file_name).unwrap();
+        dump_channels(&mocap.root, &mut csv).unwrap();
+    }
+}
+
+fn dump_channels<W: Write>(joint: &Joint, w: &mut W) -> io::Result<()> {
+    for channel in joint.channels.iter() {
+        for (index, value) in channel.values.iter().enumerate() {
+            writeln!(w, "{};{}", index, value)?;
+        }
+    }
+
+    if let JointChildren::Joints(ref joints) = joint.children {
+        for joint in joints.iter() {
+            dump_channels(joint, w)?;
+        }
+    }
+
+    Ok(())
 }
