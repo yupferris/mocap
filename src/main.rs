@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 struct Mocap {
     num_frames: u32,
     frame_time: f32,
+    channel_quantization_bits: u8, // Must be in [1, 8]
     root: Joint,
 }
 
@@ -19,18 +20,12 @@ struct Joint {
     children: JointChildren,
 }
 
-const CHANNEL_QUANTIZATION_BITS: usize = 7; // Must be in [1, 16]
-
-const CHANNEL_LPC_ORDER: usize = 1; // Must be >= 1
-const CHANNEL_LPC_COEFFICIENT_BITS: usize = 8; // Must be in [1, 8]
-
 #[derive(Debug)]
 pub struct Channel {
     type_: ChannelType,
     value_range_min: f32,
     value_range: f32,
-    lpc_coefficients: [u8; CHANNEL_LPC_ORDER],
-    residuals: Vec<i16>,
+    deltas: Vec<i8>,
 }
 
 #[derive(Debug)]
@@ -49,17 +44,18 @@ enum JointChildren {
     EndSite((f32, f32, f32)),
 }
 
-fn build_mocap(bvh: &bvh::Bvh) -> Mocap {
+fn build_mocap(bvh: &bvh::Bvh, channel_quantization_bits: u8) -> Mocap {
     let mut channel_index = 0;
 
     Mocap {
         num_frames: bvh.motion.num_frames,
         frame_time: bvh.motion.frame_time as _,
-        root: build_joint(&bvh.hierarchy.root, &bvh.motion.frames, &mut channel_index),
+        channel_quantization_bits: channel_quantization_bits,
+        root: build_joint(&bvh.hierarchy.root, &bvh.motion.frames, &mut channel_index, channel_quantization_bits),
     }
 }
 
-fn build_joint(bvh_joint: &bvh::Joint, frames: &Vec<Vec<f64>>, channel_index: &mut usize) -> Joint {
+fn build_joint(bvh_joint: &bvh::Joint, frames: &Vec<Vec<f64>>, channel_index: &mut usize, channel_quantization_bits: u8) -> Joint {
     let mut channels = Vec::new();
     for channel in bvh_joint.channels.iter() {
         let mut values = Vec::new();
@@ -78,60 +74,21 @@ fn build_joint(bvh_joint: &bvh::Joint, frames: &Vec<Vec<f64>>, channel_index: &m
         }
         let mut value_range = value_range_max - value_range_min;
         let values = values.iter().map(|value| if value_range > 0.0 {
-            (((value - value_range_min) / value_range) * (((1 << CHANNEL_QUANTIZATION_BITS) - 1) as f64)) as u16
+            (((value - value_range_min) / value_range) * (((1 << channel_quantization_bits) - 1) as f64)) as u8
         } else {
             0
         }).collect::<Vec<_>>();
 
-        let mut best = None;
-        for packed_coefficients in 0..(1 << (CHANNEL_LPC_ORDER * CHANNEL_LPC_COEFFICIENT_BITS)) {
-            let mut coefficients = [0; CHANNEL_LPC_ORDER];
-            for coefficient_index in 0..CHANNEL_LPC_ORDER {
-                coefficients[coefficient_index] = ((packed_coefficients >> (coefficient_index * CHANNEL_LPC_COEFFICIENT_BITS)) & ((1 << CHANNEL_LPC_COEFFICIENT_BITS) - 1)) as u8;
-            }
+        let mut deltas = Vec::with_capacity(values.len());
+        let mut previous_value = 0;
+        for value in values.iter() {
+            let value = *value;
 
-            let mut previous_values = [0; CHANNEL_LPC_ORDER];
+            let delta = (value as i8) - (previous_value as i8);
+            deltas.push(delta);
 
-            let mut error = 0;
-            let mut residuals = Vec::with_capacity(values.len());
-            for value in values.iter() {
-                let value = *value;
-
-                let mut prediction = 0;
-                for coefficient_index in 0..CHANNEL_LPC_ORDER {
-                    let sign_extended_coefficient = ((coefficients[coefficient_index] << (8 - CHANNEL_LPC_COEFFICIENT_BITS)) as i8) >> ((8 - CHANNEL_LPC_COEFFICIENT_BITS));
-                    prediction += ((previous_values[coefficient_index] as i32) * (sign_extended_coefficient as i32)) >> (CHANNEL_LPC_COEFFICIENT_BITS - 1);
-                }
-
-                let residual = (value as i16) - (prediction as i16);
-                residuals.push(residual);
-
-                error += (residual as i64) * (residual as i64);
-
-                let mut coefficient_index = CHANNEL_LPC_ORDER - 1;
-                while coefficient_index > 0 {
-                    previous_values[coefficient_index] = previous_values[coefficient_index - 1];
-                    coefficient_index -= 1;
-                }
-                previous_values[0] = value;
-            }
-
-            best = match best {
-                Some((best_error, best_coefficients, best_residuals)) => {
-                    if error < best_error {
-                        Some((error, coefficients, residuals))
-                    } else {
-                        Some((best_error, best_coefficients, best_residuals))
-                    }
-                }
-                None => Some((error, coefficients, residuals)),
-            };
+            previous_value = value;
         }
-        let best = best.unwrap();
-
-        println!("Best coefficients: {:?} (error: {})", best.1.iter().map(|coefficient| {
-            ((coefficient << (8 - CHANNEL_LPC_COEFFICIENT_BITS)) as i8) >> ((8 - CHANNEL_LPC_COEFFICIENT_BITS))
-        }).collect::<Vec<_>>(), best.0);
 
         channels.push(Channel {
             type_: match channel {
@@ -144,8 +101,7 @@ fn build_joint(bvh_joint: &bvh::Joint, frames: &Vec<Vec<f64>>, channel_index: &m
             },
             value_range_min: value_range_min as _,
             value_range: value_range as _,
-            lpc_coefficients: best.1,
-            residuals: best.2,
+            deltas: deltas,
         });
 
         *channel_index += 1;
@@ -156,7 +112,7 @@ fn build_joint(bvh_joint: &bvh::Joint, frames: &Vec<Vec<f64>>, channel_index: &m
         offset: (bvh_joint.offset.x as _, bvh_joint.offset.y as _, bvh_joint.offset.z as _),
         channels: channels,
         children: match bvh_joint.children {
-            bvh::JointChildren::Joints(ref bvh_joints) => JointChildren::Joints(bvh_joints.iter().map(|joint| build_joint(joint, frames, channel_index)).collect()),
+            bvh::JointChildren::Joints(ref bvh_joints) => JointChildren::Joints(bvh_joints.iter().map(|joint| build_joint(joint, frames, channel_index, channel_quantization_bits)).collect()),
             bvh::JointChildren::EndSite(ref bvh_end_site) => JointChildren::EndSite((bvh_end_site.offset.x as _, bvh_end_site.offset.y as _, bvh_end_site.offset.z as _)),
         },
     }
@@ -167,7 +123,7 @@ fn build_bvh(mocap: &Mocap) -> bvh::Bvh {
 
     bvh::Bvh {
         hierarchy: bvh::Hierarchy {
-            root: build_bvh_joint(&mocap.root, &mut frames),
+            root: build_bvh_joint(&mocap.root, &mut frames, mocap.channel_quantization_bits),
         },
         motion: bvh::Motion {
             num_frames: mocap.num_frames,
@@ -177,7 +133,7 @@ fn build_bvh(mocap: &Mocap) -> bvh::Bvh {
     }
 }
 
-fn build_bvh_joint(joint: &Joint, frames: &mut Vec<Vec<f64>>) -> bvh::Joint {
+fn build_bvh_joint(joint: &Joint, frames: &mut Vec<Vec<f64>>, channel_quantization_bits: u8) -> bvh::Joint {
     let mut channels = Vec::new();
     for channel in joint.channels.iter() {
         channels.push(match channel.type_ {
@@ -189,25 +145,14 @@ fn build_bvh_joint(joint: &Joint, frames: &mut Vec<Vec<f64>>) -> bvh::Joint {
             ChannelType::RotationZ => bvh::Channel::ZRotation,
         });
 
-        let mut previous_values = [0; CHANNEL_LPC_ORDER];
-        for (index, residual) in channel.residuals.iter().enumerate() {
-            let residual = *residual;
+        let mut previous_value = 0;
+        for (index, delta) in channel.deltas.iter().enumerate() {
+            let delta = *delta;
 
-            let mut prediction = 0;
-            for coefficient_index in 0..CHANNEL_LPC_ORDER {
-                let sign_extended_coefficient = ((channel.lpc_coefficients[coefficient_index] << (8 - CHANNEL_LPC_COEFFICIENT_BITS)) as i8) >> ((8 - CHANNEL_LPC_COEFFICIENT_BITS));
-                prediction += ((previous_values[coefficient_index] as i32) * (sign_extended_coefficient as i32)) >> (CHANNEL_LPC_COEFFICIENT_BITS - 1);
-            }
+            let value = ((previous_value as i8) + (delta as i8)) as u8;
+            frames[index].push((channel.value_range_min as f64) + ((value as f64) / (((1 << channel_quantization_bits) - 1) as f64)) * (channel.value_range as f64));
 
-            let value = ((prediction as i16) + (residual as i16)) as u16;
-            frames[index].push((channel.value_range_min as f64) + ((value as f64) / (((1 << CHANNEL_QUANTIZATION_BITS) - 1) as f64)) * (channel.value_range as f64));
-
-            let mut coefficient_index = CHANNEL_LPC_ORDER - 1;
-            while coefficient_index > 0 {
-                previous_values[coefficient_index] = previous_values[coefficient_index - 1];
-                coefficient_index -= 1;
-            }
-            previous_values[0] = value;
+            previous_value = value;
         }
     }
 
@@ -216,7 +161,7 @@ fn build_bvh_joint(joint: &Joint, frames: &mut Vec<Vec<f64>>) -> bvh::Joint {
         offset: build_bvh_offset(&joint.offset),
         channels: channels,
         children: match joint.children {
-            JointChildren::Joints(ref joints) => bvh::JointChildren::Joints(joints.iter().map(|joint| build_bvh_joint(joint, frames)).collect()),
+            JointChildren::Joints(ref joints) => bvh::JointChildren::Joints(joints.iter().map(|joint| build_bvh_joint(joint, frames, channel_quantization_bits)).collect()),
             JointChildren::EndSite(ref offset) => bvh::JointChildren::EndSite(bvh::EndSite {
                 offset: build_bvh_offset(offset),
             }),
@@ -246,7 +191,7 @@ fn main() {
     };
 
     let bvh = bvh::parse(&input).unwrap();
-    let mocap = build_mocap(&bvh);
+    let mocap = build_mocap(&bvh, 8);
     //println!("Result: {:#?}", mocap);
 
     {
@@ -268,8 +213,8 @@ fn main() {
 
 fn dump_channels_csv<W: Write>(joint: &Joint, w: &mut W) -> io::Result<()> {
     for channel in joint.channels.iter() {
-        for (index, residual) in channel.residuals.iter().enumerate() {
-            writeln!(w, "{};{}", index, residual)?;
+        for (index, delta) in channel.deltas.iter().enumerate() {
+            writeln!(w, "{};{}", index, delta)?;
         }
     }
 
@@ -284,8 +229,8 @@ fn dump_channels_csv<W: Write>(joint: &Joint, w: &mut W) -> io::Result<()> {
 
 fn dump_channels_raw<W: Write>(joint: &Joint, w: &mut W) -> io::Result<()> {
     for channel in joint.channels.iter() {
-        for residual in channel.residuals.iter() {
-            w.write_all(&[(residual >> 0) as u8, (residual >> 8) as u8])?;
+        for delta in channel.deltas.iter() {
+            w.write_all(&[*delta as u8])?;
         }
     }
 
